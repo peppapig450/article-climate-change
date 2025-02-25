@@ -254,7 +254,7 @@ def analyze_event_type_correlations(
                 "spearman_corr",
                 "spearman_p",
                 "granger_p_lag1",
-                "rev_granger_p_lag1years_count",
+                "rev_granger_p_lag1",
             ]
         ].head(10)
     )
