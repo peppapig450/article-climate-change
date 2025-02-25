@@ -2,21 +2,29 @@ from __future__ import annotations
 
 import argparse
 import logging
+import warnings
 from pathlib import Path
+
 import pandas as pd
-from scipy.stats import spearmanr, pearsonr, kendalltau
-from statsmodels.tsa.stattools import grangercausalitytests, adfuller
+from scipy.stats import kendalltau, pearsonr, spearmanr
+from statsmodels.tsa.stattools import adfuller, grangercausalitytests
+
 from aggregate_and_visualize import (
     convert_damage,
     process_giss_data,
 )
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels")
+
+# Define logging level mapping
+LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
 
 
 def compute_impact(
@@ -76,6 +84,9 @@ def aggregate_by_event_type(
         agg_chunks.append(aggregated)
 
     df = pd.concat(agg_chunks).groupby(["year", "event_type"]).sum().reset_index()
+    year_counts = df.groupby("event_type")["year"].nunique()
+    logging.info("Event types and year counts before filtering:")
+    logging.info(year_counts)
     return df
 
 
@@ -111,6 +122,7 @@ def check_stationarity(series: pd.Series, max_diff: int = 2) -> tuple[pd.Series,
             return series, 0
         result = adfuller(test_series, autolag="AIC")
         p_value = result[1]
+        logging.debug(f"Diff {diff}: p-value = {p_value:.3f}")
         if p_value < 0.05:  # Stationary if p < 0.05
             return test_series, diff
         series = test_series
@@ -173,6 +185,7 @@ def compute_granger_causality(
         result = grangercausalitytests(
             granger_data[["temp_anomaly", "composite_index"]],
             maxlag=max_lag,
+            verbose=False,
         )
         for lag in range(1, max_lag + 1):
             granger_p_lags[lag - 1] = result[lag][0]["ssr_chi2test"][1]
@@ -181,6 +194,7 @@ def compute_granger_causality(
         result_rev = grangercausalitytests(
             granger_data[["composite_index", "temp_anomaly"]],
             maxlag=max_lag,
+            verbose=False,
         )
         for lag in range(1, max_lag + 1):
             rev_granger_p_lags[lag - 1] = result_rev[lag][0]["ssr_chi2test"][1]
@@ -317,7 +331,23 @@ def main():
         default=2,
         help="Maximum lag for Granger Causality test",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=LOG_LEVELS.keys(),
+        help="Set the logging level",
+    )
     args = parser.parse_args()
+
+    # Set up logging
+    logging.basicConfig(
+        level=LOG_LEVELS[args.log_level],
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[logging.StreamHandler()],
+    )
+
+    # Ensure level is actually updated
+    logging.getLogger().setLevel(LOG_LEVELS[args.log_level])
 
     csv_file = Path(args.csv_file).resolve()
     giss_file = Path(args.giss_file).resolve()
