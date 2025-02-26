@@ -49,7 +49,9 @@ def compute_aicc(aic_values: NDArray, n: int, lags: NDArray, m=2) -> NDArray:
         NDArray: Array of AICc values.
     """
     k = lags * m**2 + m  # AR coefficients + intercepts
-    penalty = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.inf)
+    # Prevent division by zero or negative denominator
+    with np.errstate(divide="ignore", invalid="ignore"):
+        penalty = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.inf)
     return aic_values + penalty
 
 
@@ -129,8 +131,10 @@ def aggregate_by_event_type(
             agg_dict[key]["total_impact"] += cast(float, row.total_impact)
             agg_dict[key]["event_frequency"] += cast(int, row.event_frequency)
 
-    df = pd.DataFrame.from_dict(agg_dict, orient="index").reset_index()
-    df.columns = ["year", "event_type", "total_impact", "event_frequency"]
+    df = pd.DataFrame.from_dict(agg_dict, orient="index").reset_index(
+        names=["year", "event_type", "total_impact", "event_frequency"]
+    )
+
     year_counts = df.groupby("event_type")["year"].nunique()
     logging.info("Event types and year counts before filtering:")
     logging.info(year_counts)
@@ -275,28 +279,36 @@ def compute_granger_causality(
     Returns:
         tuple: (forward p-values by criterion, reverse p-values by criterion, temp diff order, composite diff order)
     """
+    event_type = group["event_type"].iloc[0]
+    years = group["year"].sort_values().unique()
+    year_diffs = np.diff(years)
+    if np.any(year_diffs > 1):
+        logging.warning(
+            f"{event_type}: Skipping Granger causality due to non-consecutive years (gaps: {year_diffs[year_diffs > 1]})"
+        )
+        test_types = ["params_ftest", "ssr_ftest"]
+        return (
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            0,
+            0,
+        )
+
     # Early exit if data is all NaN
     if group["temp_anomaly"].isna().all() or group["composite_index"].isna().all():
         logging.debug(f"{group['event_type'].iloc[0]}: All NaN in input series")
+        test_types = ["params_ftest", "ssr_ftest"]
         return (
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
             0,
             0,
         )
 
     # Set up time-indexed series for stationarity checks
-    group_indexed = group.set_index(pd.to_datetime(group["year"], format="%Y"))
+    group_indexed = group.set_index(pd.to_datetime(group["year"], format="%Y")).asfreq(
+        "YS"
+    )
     temp_series, temp_diff = check_stationarity(
         group_indexed["temp_anomaly"], max_diff=2, min_len=max_lag + 1
     )
@@ -315,21 +327,12 @@ def compute_granger_causality(
     n = len(granger_data)
     if n <= max_lag + 1:
         logging.debug(f"Sample size too small: {n} <= {max_lag + 1}")
+        test_types = ["params_ftest", "ssr_ftest"]
         return (
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            temp_diff,
-            comp_diff,
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            0,
+            0,
         )
 
     try:
@@ -415,39 +418,22 @@ def compute_granger_causality(
         logging.debug(
             f"Granger test failed due to VAR fitting error (e.g., singular matrix): {str(e)}"
         )
+        test_types = ["params_ftest", "ssr_ftest"]
         return (
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            temp_diff,
-            comp_diff,
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            0,
+            0,
         )
+
     except Exception as e:
         logging.debug(f"Granger test failed due to unexpected error: {str(e)}")
+        test_types = ["params_ftest", "ssr_ftest"]
         return (
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            {
-                "aicc": {
-                    "params_ftest": [float("nan")] * max_lag,
-                    "ssr_ftest": [float("nan")] * max_lag,
-                }
-            },
-            temp_diff,
-            comp_diff,
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
+            0,
+            0,
         )
 
     return (
@@ -483,14 +469,7 @@ def analyze_event_type_correlations(
     correlations = []
     for event_type, group in merged_df.groupby("event_type"):
         years = group["year"].sort_values().unique()
-        if len(years) < 2:
-            continue
-        if np.any((years_diff := np.diff(years)) > 1):
-            logging.warning(
-                f"{event_type}: Non-consecutive years detected, which may affect time series analysis"
-            )
-
-        if len(group) < min_years:
+        if len(years) < 2 or len(group) < min_years:
             continue
 
         corr_results = compute_correlations(group, lag_years)
@@ -524,6 +503,25 @@ def analyze_event_type_correlations(
     corr_df = pd.DataFrame(correlations).sort_values(
         by="spearman_corr", ascending=False
     )
+
+    # Highlight significant Granger results
+    significant = []
+    for _, row in corr_df.iterrows():
+        for col in corr_df.columns:
+            if "p_lag" in col and pd.notna(row[col]) and row[col] < 0.05:
+                direction = "temp -> event" if "rev_" not in col else "event -> temp"
+                lag = int(col.split("_p_lag")[1])
+                test = col.split("_")[1] if "rev_" not in col else col.split("_")[2]
+                crit = col.split("_")[0]
+                significant.append(
+                    f"{row['event_type']}: {direction}, lag {lag}, {crit}_{test}_p = {row[col]:.3f}, n = {row['granger_years_count']}"
+                )
+
+    if significant:
+        logging.info("Significant Granger casuality results (p < 0.05):")
+        for sig in significant:
+            logging.info(sig)
+
     logging.info(
         "Top 10 event types by Spearman correlation with temperature anomalies:"
     )
@@ -640,11 +638,24 @@ def main():
     )
 
     if not corr_df.empty:
-        print(
-            "Event types correlations and Granger Causality with temperature anomalies:"
-        )
+        logging.info("Full results saved to 'event_type_analysis.csv'")
         pd.set_option("display.float_format", "{:.3f}".format)
-        print(corr_df.to_string(index=False))
+        corr_df.to_csv("event_type_analysis.csv", index=False)
+        logging.info("Summary of correlations and Granger Causality (lag 1 only):")
+        logging.info(
+            corr_df[
+                [
+                    "event_type",
+                    "spearman_corr",
+                    "spearman_p",
+                    "granger_years_count",
+                    "aicc_params_ftest_p_lag1",
+                    "aicc_ssr_ftest_p_lag1",
+                    "aicc_rev_params_ftest_p_lag1",
+                    "aicc_rev_ssr_ftest_p_lag1",
+                ]
+            ].to_string(index=False)
+        )
     else:
         print("No significant correlations or causality found.")
 
