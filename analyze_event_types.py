@@ -55,7 +55,7 @@ def compute_aicc(aic_values: NDArray, n: int, lags: NDArray, m=2) -> NDArray:
         penalty = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.inf)
     return aic_values + penalty
 
-
+# TODO: add justifications and reasoning for injury/death weights
 def compute_impact(
     df: pd.DataFrame, injury_weight: float, death_weight: float
 ) -> pd.Series:
@@ -64,8 +64,8 @@ def compute_impact(
 
     Parameters:
         df (pd.DataFrame): DataFrame with damage, injury, and death columns.
-        injury_weight (float): Economic weight per injury.
-        death_weight (float): Economic weight per death.
+        injury_weight (float): Economic weight per injury. (Default: $200,000)
+        death_weight (float): Economic weight per death. (Default: $5,000,000)
 
     Returns:
         pd.Series: Impact values combining damages, injuries, and deaths.
