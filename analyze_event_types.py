@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pandas as pd
-from scipy.stats import kendalltau, pearsonr, spearmanr
+from scipy.stats import kendalltau, pearsonr, spearmanr, permutation_test
+from sklearn.utils import resample
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
 
@@ -20,7 +21,7 @@ from aggregate_and_visualize import (
 from visualize_event_types import launch_dashboard
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
+    from numpy.typing import NDArray, ArrayLike
 
 # Suppress FutureWarnings from statsmodels cautiously
 warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels")
@@ -34,6 +35,79 @@ LOG_LEVELS = {
     "DEBUG": logging.DEBUG,
     "NOTSET": logging.NOTSET,
 }
+
+
+def spearman_statistic(x: float, y: float):
+    """Wrapper for Spearman's correlation coefficient compatible with permutation_test."""
+    return spearmanr(x, y)[0]
+
+
+def bootstrap_ci(
+    x: ArrayLike,
+    y: ArrayLike,
+    n_bootstraps: int = 1000,
+    ci: float = 95,
+    random_state: int | np.random.RandomState | None = None,
+) -> tuple[float, float]:
+    """Compute confidence interval for Spearman's correlation using bootstrapping.
+
+    This function estimates the variability of Spearman's rank correlation coefficient
+    by resampling paired observations with replacement, suitable for small sample sizes.
+
+    Args:
+        x: First array of observations (e.g., composite_index).
+        y: Second array of observations (e.g., temp_anomaly), paired with x.
+        n_bootstraps: Number of bootstrap iterations (default: 1000).
+        ci: Confidence level as a percentage (default: 95).
+        random_state: Seed or RandomState for reproducibility (default: None).
+
+    Returns:
+        Tuple of (lower, upper) confidence interval bounds for Spearman's rho.
+
+    Raises:
+        ValueError: If inputs are invalid (e.g., mismatched lengths, insufficient size,
+                    non-numeric data, or invalid parameters).
+    """
+    # Convert inputs to numpy arrays for consistency
+    x = np.asarray(x)
+    y = np.asarray(y)
+
+    # Input validation
+    if len(x) != len(y):
+        raise ValueError(
+            f"x and y must have the same length, got {len(x)} and {len(y)}"
+        )
+    n = len(x)
+    if len(x) < 2:
+        raise ValueError("Input arrays must have at least 2 elements for correlation")
+    if not np.issubdtype(x.dtype, np.number) or not np.issubdtype(y.dtype, np.number):
+        raise ValueError("x and y must contain numeric data")
+    if np.any(np.isnan(x)) or np.any(np.isnan(y)):
+        raise ValueError("x and y must not contain NaN values")
+    if n_bootstraps < 1:
+        raise ValueError("n_bootstraps must be positive")
+    if not 0 < ci < 100:
+        raise ValueError("ci must be between 0 and 100")
+
+    # Bootstrap resampling
+    boot_corrs = np.empty(n_bootstraps, dtype=float)
+    rng = np.random.RandomState(random_state) if isinstance(random_state, int) else random_state
+    for i in range(n_bootstraps):
+        indices = resample(np.arange(n), replace=True, n_samples=n, random_state=rng)
+        x_boot = x[indices]
+        y_boot = y[indices]
+        corr, _ = spearmanr(x_boot, y_boot)
+        boot_corrs[i] = corr
+
+    # Check if we have enough valid samples
+    if len(boot_corrs) < 2:
+        raise ValueError("Too few valid bootstrap samples to compute CI")
+
+    # Compute percentiles
+    lower = np.percentile(boot_corrs, (100 - ci) / 2)
+    upper = np.percentile(boot_corrs, 100 - (100 - ci) / 2)
+    
+    return lower, upper
 
 
 def compute_aicc(aic_values: NDArray, n: int, lags: NDArray, m=2) -> NDArray:
@@ -54,6 +128,7 @@ def compute_aicc(aic_values: NDArray, n: int, lags: NDArray, m=2) -> NDArray:
     with np.errstate(divide="ignore", invalid="ignore"):
         penalty = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.inf)
     return aic_values + penalty
+
 
 # TODO: add justifications and reasoning for injury/death weights
 def compute_impact(
@@ -210,7 +285,9 @@ def check_stationarity(
     ), max_diff  # Return last differenced if still non-stationary
 
 
-def compute_correlations(group: pd.DataFrame, lag_years: int) -> dict:
+def compute_correlations(
+    group: pd.DataFrame, lag_years: int, min_size: int = 10
+) -> dict:
     """
     Compute various correlation metrics for a single event type group.
 
@@ -226,6 +303,27 @@ def compute_correlations(group: pd.DataFrame, lag_years: int) -> dict:
 
     if len(valid_data) < 2 or len(valid_lagged) < 2:
         return {}
+
+    # Warning for small sample sizes
+    if len(valid_data) < min_size:
+        logging.warning(
+            f"{group['event_type'].iloc[0]}: Sample size {len(valid_data)} < {min_size}. Results may be unreliable."
+        )
+
+    perm_result = permutation_test(
+        (valid_data["composite_index"], valid_data["temp_anomaly"]),
+        statistic=spearman_statistic,
+        permutation_type="pairings",  
+        n_resamples=999,  # Reasonable default for approximation; adjust as needed
+        alternative="two-sided",
+    )
+    spearman_corr = perm_result.statistic
+    spearman_p_perm = perm_result.pvalue
+
+    # Bootstrap CI
+    spearman_lower, spearman_upper = bootstrap_ci(
+        valid_data["composite_index"], valid_data["temp_anomaly"]
+    )
 
     spearman_corr, spearman_p = spearmanr(
         valid_data["composite_index"], valid_data["temp_anomaly"]
@@ -250,6 +348,9 @@ def compute_correlations(group: pd.DataFrame, lag_years: int) -> dict:
     return {
         "spearman_corr": spearman_corr,
         "spearman_p": spearman_p,
+        "spearman_p_perm": spearman_p_perm,
+        "spearman_ci_lower": spearman_lower,
+        "spearman_ci_upper": spearman_upper,
         "pearson_corr": pearson_corr,
         "pearson_p": pearson_p,
         "kendall_corr": kendall_corr,

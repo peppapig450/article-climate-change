@@ -42,17 +42,17 @@ def launch_dashboard(merged_df: pd.DataFrame, corr_df: pd.DataFrame):
                     dcc.Tab(
                         label="Correlation Scatter",
                         children=[
-                            html.H3("Correlation Between Temperature and Event Index"),
+                            html.H3("Correlation Between Temperature Anomaly and Composite Index"),
                             dcc.Dropdown(
                                 id="scatter-event-dropdown",
                                 options=[
                                     {"label": event, "value": event}
-                                    for event in event_types
+                                    for event in merged_df["event_type"].unique()
                                 ],
                                 value=event_types[0],
                                 multi=False,
                             ),
-                            dcc.Graph(id="scatter-splot"),
+                            dcc.Graph(id="scatter-plot"),
                         ],
                     ),
                     # Tab 3: Granger Causality (Detailed Statistical Plot)
@@ -101,26 +101,41 @@ def launch_dashboard(merged_df: pd.DataFrame, corr_df: pd.DataFrame):
         fig.update_layout(yaxis_title="Value")
         return fig
 
-    # TODO: doesn't look right 
     # Callback 2: Update Scatter Plot
     @app.callback(
         Output("scatter-plot", "figure"), [Input("scatter-event-dropdown", "value")]
     )
-    def update_scatter(event):
+    def update_scatter_plot(event):
         event_data = merged_df[merged_df["event_type"] == event]
-        corr = event_data["temp_anomaly"].corr(
-            event_data["composite_index"], method="spearman"
+        corr_info = corr_df[corr_df["event_type"] == event].iloc[0]
+        
+        annotation_text = (
+            f"Composite: {corr_info['spearman_corr']:.3f} (p={corr_info['spearm_p_perm']:.3f}), "
+            f"CI=[{corr_info['spearman_ci_lower']:.3f}, {corr_info['spearman_ci_upper']:.3f}], "
+            f"n={corr_info['years_count']}"
         )
+        
         fig = px.scatter(
             event_data,
             x="temp_anomaly",
             y="composite_index",
             trendline="ols",
-            title=f"Scatter: {event} (Spearman Corr: {corr:.2f})",
+            title=f"Scatter Plot: {event}",
             labels={
                 "temp_anomaly": "Temperature Anomaly",
                 "composite_index": "Composite Index",
             },
+        )
+        fig.update_layout(
+            annotations=[dict(
+                text=annotation_text,
+                xref="paper",
+                yref="paper",
+                x=0.05,
+                y=0.95,
+                showarrow=False,
+                font=dict(size=12)
+            )]
         )
         return fig
 
