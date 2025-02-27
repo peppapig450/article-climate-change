@@ -17,6 +17,7 @@ from aggregate_and_visualize import (
     convert_damage,
     process_giss_data,
 )
+from visualize_event_types import launch_dashboard
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -239,6 +240,13 @@ def compute_correlations(group: pd.DataFrame, lag_years: int) -> dict:
         valid_lagged["composite_index"], valid_lagged["temp_anomaly_lagged"]
     )
 
+    impact_spearman_corr, impact_spearman_p = spearmanr(
+        valid_data["norm_total_impact"], valid_data["temp_anomaly"]
+    )
+    frequency_spearman_corr, frequency_spearman_p = spearmanr(
+        valid_data["norm_event_frequency"], valid_data["temp_anomaly"]
+    )
+
     return {
         "spearman_corr": spearman_corr,
         "spearman_p": spearman_p,
@@ -250,6 +258,10 @@ def compute_correlations(group: pd.DataFrame, lag_years: int) -> dict:
         "lagged_spearman_p": lagged_p,
         "years_count": len(valid_data),
         "lagged_years_count": len(valid_lagged),
+        "impact_spearman_corr": impact_spearman_corr,
+        "impact_spearman_p": impact_spearman_p,
+        "frequency_spearman_corr": frequency_spearman_corr,
+        "frequency_spearman_p": frequency_spearman_p,
     }
 
 
@@ -450,7 +462,7 @@ def analyze_event_type_correlations(
     min_years: int = 10,
     lag_years: int = 1,
     max_granger_lag: int = 2,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute multiple correlation metrics and Granger Causality (forward and reverse) between each event type's
     composite index and temperature anomalies, with dynamic stationarity adjustment.
@@ -458,7 +470,9 @@ def analyze_event_type_correlations(
     merged_df = pd.merge(noaa_df, giss_df, on="year", how="inner")
     if merged_df.empty:
         logging.warning("No overlapping data between NOAA and GISS datasets")
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
+
+    unlagged_merged_df = merged_df.copy(deep=True)
 
     merged_df = merged_df.assign(
         temp_anomaly_lagged=lambda x: x.groupby("event_type")["temp_anomaly"].shift(
@@ -538,7 +552,7 @@ def analyze_event_type_correlations(
             ]
         ].head(10)
     )
-    return corr_df
+    return corr_df, unlagged_merged_df
 
 
 def main():
@@ -629,7 +643,7 @@ def main():
         aggregated_df, args.impact_weight, args.frequency_weight
     )
 
-    corr_df = analyze_event_type_correlations(
+    corr_df, merged_df = analyze_event_type_correlations(
         noaa_df,
         giss_df,
         min_years=args.min_years,
@@ -648,6 +662,8 @@ def main():
                     "event_type",
                     "spearman_corr",
                     "spearman_p",
+                    "impact_spearman_corr",
+                    "frequency_spearman_corr",
                     "granger_years_count",
                     "aicc_params_ftest_p_lag1",
                     "aicc_ssr_ftest_p_lag1",
@@ -656,6 +672,7 @@ def main():
                 ]
             ].to_string(index=False)
         )
+        launch_dashboard(merged_df, corr_df)
     else:
         print("No significant correlations or causality found.")
 

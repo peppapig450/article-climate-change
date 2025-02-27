@@ -100,3 +100,85 @@ def launch_dashboard(merged_df: pd.DataFrame, corr_df: pd.DataFrame):
         )
         fig.update_layout(yaxis_title="Value")
         return fig
+
+    # TODO: doesn't look right 
+    # Callback 2: Update Scatter Plot
+    @app.callback(
+        Output("scatter-plot", "figure"), [Input("scatter-event-dropdown", "value")]
+    )
+    def update_scatter(event):
+        event_data = merged_df[merged_df["event_type"] == event]
+        corr = event_data["temp_anomaly"].corr(
+            event_data["composite_index"], method="spearman"
+        )
+        fig = px.scatter(
+            event_data,
+            x="temp_anomaly",
+            y="composite_index",
+            trendline="ols",
+            title=f"Scatter: {event} (Spearman Corr: {corr:.2f})",
+            labels={
+                "temp_anomaly": "Temperature Anomaly",
+                "composite_index": "Composite Index",
+            },
+        )
+        return fig
+
+    # TODO: doesnt look right
+    # Callback 3: Update Granger Causality Bar Plot
+    @app.callback(
+        Output("granger-bar-plot", "figure"), [Input("granger-event-dropdown", "value")]
+    )
+    def update_granger_bar(event):
+        event_corr = corr_df[corr_df["event_type"] == event]
+        lags = range(1, 3)  # Adjust based on max_granger_lag; here, max=2
+        p_values = [
+            event_corr[f"aicc_params_ftest_p_lag{lag}"].values[0]
+            if f"aicc_params_ftest_p_lag{lag}" in event_corr.columns
+            else 1.0
+            for lag in lags
+        ]
+        fig = go.Figure([go.Bar(x=[f"Lag {lag}" for lag in lags], y=p_values)])
+        fig.add_hline(
+            y=0.05,
+            line_dash="dash",
+            line_color="red",
+            annotation_text="Significance Threshold (0.05)",
+        )
+        fig.update_layout(
+            title=f"Granger Causality p-values: {event}",
+            yaxis_title="p-value",
+            yaxis_range=[0, 1],
+        )
+        return fig
+
+    # TODO: doesnt look right
+    # Callback 4: Update Correlation Heatmap
+    @app.callback(
+        Output("correlation-heatmap", "figure"),
+        [
+            Input("event-dropdown", "value")
+        ],  # Static for now, using event-dropdown as a placeholder
+    )
+    def update_heatmap(_):
+        pivot_df = merged_df.pivot(
+            index="year", columns="event_type", values="composite_index"
+        )
+        pivot_df["temp_anomaly"] = merged_df.groupby("year")["temp_anomaly"].first()
+        corr_matrix = pivot_df.corr(method="spearman")
+        fig = px.imshow(
+            corr_matrix[["temp_anomaly"]]
+            .drop("temp_anomaly")
+            .sort_values(by="temp_anomaly", ascending=False),
+            color_continuous_scale="RdBu_r",
+            zmin=-1,
+            zmax=1,
+            title="Spearman Correlation: Temperature Anomaly vs. Event Types",
+            labels={"color": "Correlation"},
+        )
+        return fig
+
+    # Run the Dash app
+    app.run_server(debug=True)
+
+    app.run(debug=True)
