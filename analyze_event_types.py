@@ -5,11 +5,11 @@ import logging
 import warnings
 from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import numpy as np
 import pandas as pd
-from scipy.stats import kendalltau, pearsonr, spearmanr, permutation_test
+from scipy.stats import kendalltau, pearsonr, permutation_test, spearmanr
 from sklearn.utils import resample
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.tsa.vector_ar.var_model import VAR
@@ -21,7 +21,8 @@ from aggregate_and_visualize import (
 from visualize_event_types import launch_dashboard
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray, ArrayLike
+    from numpy import float64, int_
+    from numpy.typing import ArrayLike, NDArray
 
 # Suppress FutureWarnings from statsmodels cautiously
 warnings.filterwarnings("ignore", category=FutureWarning, module="statsmodels")
@@ -36,10 +37,29 @@ LOG_LEVELS = {
     "NOTSET": logging.NOTSET,
 }
 
+# Minumum sample sizes for reliable analysis
+MIN_SAMPLE_CORR: Final[int] = 10  # For correlation calculations, based on statistical rule of thumb
+MIN_SAMPLE_GRANGER: Final[int] = 20  # # For Granger causality, stricter due to model complexity
 
-def spearman_statistic(x: float, y: float):
-    """Wrapper for Spearman's correlation coefficient compatible with permutation_test."""
-    return spearmanr(x, y)[0]
+
+def spearman_statistic(x: ArrayLike, y: ArrayLike) -> float:
+    """
+    Compute Spearman's correlation coefficient for permutation testing.
+
+    Parameters
+    ----------
+    x : array_like
+        First set of observations.
+    y : array_like
+        Second set of observations.
+
+    Returns
+    -------
+    float
+        Spearman's rank correlation coefficient.
+
+    """
+    return float(spearmanr(x, y)[0])
 
 
 def bootstrap_ci(
@@ -49,24 +69,36 @@ def bootstrap_ci(
     ci: float = 95,
     random_state: int | np.random.RandomState | None = None,
 ) -> tuple[float, float]:
-    """Compute confidence interval for Spearman's correlation using bootstrapping.
+    """
+    Compute confidence interval for Spearman's correlation using bootstrapping.
 
     This function estimates the variability of Spearman's rank correlation coefficient
     by resampling paired observations with replacement, suitable for small sample sizes.
 
-    Args:
-        x: First array of observations (e.g., composite_index).
-        y: Second array of observations (e.g., temp_anomaly), paired with x.
-        n_bootstraps: Number of bootstrap iterations (default: 1000).
-        ci: Confidence level as a percentage (default: 95).
-        random_state: Seed or RandomState for reproducibility (default: None).
+    Parameters
+    ----------
+    x : array_like
+        First array of observations (e.g., composite_index).
+    y : array_like
+        Second array of observations (e.g., temp_anomaly), paired with x.
+    n_bootstraps : int, optional
+        Number of bootstrap iterations (default: 1000).
+    ci : float, optional
+        Confidence level as a percentage (default: 95).
+    random_state : int or np.random.RandomState, optional
+        Seed or RandomState for reproducibility (default: None).
 
-    Returns:
+    Returns
+    -------
+    tuple
         Tuple of (lower, upper) confidence interval bounds for Spearman's rho.
 
-    Raises:
-        ValueError: If inputs are invalid (e.g., mismatched lengths, insufficient size,
-                    non-numeric data, or invalid parameters).
+    Raises
+    ------
+    ValueError
+        If inputs are invalid (e.g., mismatched lengths, insufficient size,
+        non-numeric data, or invalid parameters).
+
     """
     # Convert inputs to numpy arrays for consistency
     x = np.asarray(x)
@@ -74,11 +106,9 @@ def bootstrap_ci(
 
     # Input validation
     if len(x) != len(y):
-        raise ValueError(
-            f"x and y must have the same length, got {len(x)} and {len(y)}"
-        )
+        raise ValueError(f"x and y must have the same length, got {len(x)} and {len(y)}")
     n = len(x)
-    if len(x) < 2:
+    if n < 2:
         raise ValueError("Input arrays must have at least 2 elements for correlation")
     if not np.issubdtype(x.dtype, np.number) or not np.issubdtype(y.dtype, np.number):
         raise ValueError("x and y must contain numeric data")
@@ -106,44 +136,73 @@ def bootstrap_ci(
     # Compute percentiles
     lower = np.percentile(boot_corrs, (100 - ci) / 2)
     upper = np.percentile(boot_corrs, 100 - (100 - ci) / 2)
-    
+
     return lower, upper
 
 
-def compute_aicc(aic_values: NDArray, n: int, lags: NDArray, m=2) -> NDArray:
+def compute_aicc(aic_values: ArrayLike, n: int, lags: ArrayLike, m: int = 2) -> NDArray[float64]:
     """
     Compute AICc for VAR models, including intercepts.
 
-    Parameters:
-        aic_values (NDArray): Array of AIC values for lags 0 to max_lag.
-        n (int): Number of observations.
-        lags (NDArray): Array of lag values corresponding to aic_values.
-        m (int): Number of variables in the VAR model (default=2).
+    Parameters
+    ----------
+    aic_values : array_like
+        Array of AIC values for lags 0 to max_lag.
+    n : int
+        Number of observations.
+    lags : array_like
+        Array of lag values corresponding to aic_values.
+    m : int, optional
+        Number of variables in the VAR model (default=2).
 
-    Returns:
-        NDArray: Array of AICc values.
+    Returns
+    -------
+    ndarray
+        Array of AICc values.
+
+    Notes
+    -----
+    AICc is calculated as AIC + 2 * k * (k + 1) / (n - k - 1), where k is the number
+    of parameters. For VAR models, k = lags * m**2 + m (including intercepts).
+
     """
-    k = lags * m**2 + m  # AR coefficients + intercepts
+    aic_values_array: NDArray[float64] = np.asarray(aic_values, dtype=np.float64)
+    lags_array: NDArray[int_] = np.asarray(lags, dtype=np.int_)
+    k: NDArray[int_] = lags_array * m**2 + m  # AR coefficients + intercepts
+
     # Prevent division by zero or negative denominator
     with np.errstate(divide="ignore", invalid="ignore"):
-        penalty = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.inf)
-    return aic_values + penalty
+        penalty: NDArray[float64] = np.where(n > k + 1, 2 * k * (k + 1) / (n - k - 1), np.float64(np.inf))
+    return aic_values_array + penalty
 
 
-# TODO: add justifications and reasoning for injury/death weights
-def compute_impact(
-    df: pd.DataFrame, injury_weight: float, death_weight: float
-) -> pd.Series:
+def compute_impact(df: pd.DataFrame, injury_weight: float, death_weight: float) -> pd.Series:
     """
-    Compute the impact for each event in the DataFrame.
+    Compute the economic impact for each event in the DataFrame.
 
-    Parameters:
-        df (pd.DataFrame): DataFrame with damage, injury, and death columns.
-        injury_weight (float): Economic weight per injury. (Default: $200,000)
-        death_weight (float): Economic weight per death. (Default: $5,000,000)
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing columns for damage, injuries, and deaths.
+    injury_weight : float
+        Economic weight per injury (default: 50000). Based on rough estimates of
+        medical costs and lost productivity; adjust per studies (e.g., DOT data).
+    death_weight : float
+        Economic weight per death (default: 7600000). Based on FEMA's 2023 statistical
+        value of a human life for cost-benefit analysis in disaster mitigation.
 
-    Returns:
-        pd.Series: Impact values combining damages, injuries, and deaths.
+    Returns
+    -------
+    pd.Series
+        Series of impact values combining property/crop damages, injuries, and deaths.
+
+    Notes
+    -----
+    The impact is calculated as:
+    impact = damage_property + damage_crops + (injuries_direct + injuries_indirect) * injury_weight
+             + (deaths_direct + deaths_indirect) * death_weight
+    where damages are converted using `convert_damage`.
+
     """
     return (
         convert_damage(df["damage_property"])
@@ -155,8 +214,8 @@ def compute_impact(
 
 def aggregate_by_event_type(
     csv_file: str,
-    injury_weight: float = 200000,
-    death_weight: float = 5000000,
+    injury_weight: float = 50000,
+    death_weight: float = 7600000,
 ) -> pd.DataFrame:
     """
     Aggregate NOAA data by year and event_type efficiently using a running total.
@@ -164,13 +223,20 @@ def aggregate_by_event_type(
     This function processes large datasets in chunks, accumulating totals in a defaultdict
     to avoid multiple concatenations and groupby operations, improving memory and time efficiency.
 
-    Parameters:
-        csv_file (str): Path to the NOAA CSV file.
-        injury_weight (float): Economic weight per injury (default=200000).
-        death_weight (float): Economic weight per death (default=5000000).
+    Parameters
+    ----------
+    csv_file : str
+        Path to the NOAA CSV file.
+    injury_weight : float, optional
+        Economic weight per injury (default=50000).
+    death_weight : float, optional
+        Economic weight per death (default=7600000).
 
-    Returns:
-        pd.DataFrame: Aggregated DataFrame with year, event_type, total_impact, and event_frequency.
+    Returns
+    -------
+    pd.DataFrame
+        Aggregated DataFrame with columns: year, event_type, total_impact, event_frequency.
+
     """
     usecols = [
         "year",
@@ -224,54 +290,75 @@ def compute_composite_index(
     Compute normalized impact, frequency, and composite index for each event type.
 
     The composite index is a weighted sum of normalized total impact and event frequency.
-    Default weights are 0.5 each, assuming equal importance. Adjust based on domain knowledge
-    (e.g., increase impact_weight if economic damage is prioritized over frequency).
 
-    Parameters:
-        df (pd.DataFrame): DataFrame with total_impact and event_frequency.
-        impact_weight (float): Weight for normalized impact (default=0.5).
-        frequency_weight (float): Weight for normalized frequency (default=0.5).
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing 'total_impact' and 'event_frequency' columns.
+    impact_weight : float, optional
+        Weight for normalized total impact (default=0.5).
+    frequency_weight : float, optional
+        Weight for normalized event frequency (default=0.5).
 
-    Returns:
-        pd.DataFrame: DataFrame with added norm_total_impact, norm_event_frequency, and composite_index.
+    Returns
+    -------
+    pd.DataFrame
+        Input DataFrame with additional columns:
+        - norm_total_impact: Normalized total impact per event type.
+        - norm_event_frequency: Normalized event frequency per event type.
+        - composite_index: Weighted sum of norm_total_impact and norm_event_frequency.
+
+    Notes
+    -----
+    Normalization is done per event type using min-max scaling.
+    If the range is zero, the normalized value is set to 0.
+
     """
     df = df.assign(
         norm_total_impact=lambda x: x.groupby("event_type")["total_impact"].transform(
             lambda s: (s - s.min()) / (s.max() - s.min()) if s.max() != s.min() else 0
         ),
-        norm_event_frequency=lambda x: x.groupby("event_type")[
-            "event_frequency"
-        ].transform(
+        norm_event_frequency=lambda x: x.groupby("event_type")["event_frequency"].transform(
             lambda s: (s - s.min()) / (s.max() - s.min()) if s.max() != s.min() else 0
         ),
         composite_index=lambda x: (
-            impact_weight * x["norm_total_impact"]
-            + frequency_weight * x["norm_event_frequency"]
+            impact_weight * x["norm_total_impact"] + frequency_weight * x["norm_event_frequency"]
         ),
     )
     return df
 
 
-def check_stationarity(
-    series: pd.Series, max_diff: int = 2, min_len: int = 5
-) -> tuple[pd.Series, int]:
+def check_stationarity(series: pd.Series, max_diff: int = 2, min_len: int = 5) -> tuple[pd.Series, int]:
     """
-    Check stationarity with ADF test and apply differencing if needed up to max_diff times.
+    Check stationarity using the Augmented Dickey-Fuller test and apply differencing if necessary.
 
-    Parameters:
-        series (pd.Series): Time series to test.
-        max_diff (int): Maximum number of differencing attempts (default=2).
-        min_len (int): Minimum length for ADF test (default=5).
+    Parameters
+    ----------
+    series : pd.Series
+        Time series to test for stationarity.
+    max_diff : int, optional
+        Maximum number of differencing attempts (default=2).
+    min_len : int, optional
+        Minimum length of the series for ADF test (default=5).
 
-    Returns:
-        tuple: (differenced series, number of differences applied)
+    Returns
+    -------
+    tuple
+        - differenced_series : pd.Series
+            The differenced series if non-stationary, else the original series.
+        - diff_order : int
+            Number of differences applied to achieve stationarity.
+
+    Notes
+    -----
+    The function applies differencing up to `max_diff` times until the series is stationary
+    (p-value < 0.05 in ADF test) or the maximum differencing is reached.
+    If the series length is less than `min_len` after differencing, it returns the original series.
+
     """
     original_index = series.index
     for diff in range(max_diff + 1):
-        if diff > 0:
-            test_series = series.diff().dropna()
-        else:
-            test_series = series.dropna()
+        test_series = series.diff().dropna() if diff > 0 else series.dropna()
         if len(test_series) < min_len:  # Too few points for reliable ADF
             return series, 0
         result = adfuller(test_series, autolag="AIC")
@@ -285,18 +372,47 @@ def check_stationarity(
     ), max_diff  # Return last differenced if still non-stationary
 
 
-def compute_correlations(
-    group: pd.DataFrame, lag_years: int, min_size: int = 10
-) -> dict:
+def compute_correlations(group: pd.DataFrame, lag_years: int, min_size: int = 10) -> dict:
     """
-    Compute various correlation metrics for a single event type group.
+    Compute various correlation metrics between composite index and temperature anomalies.
 
-    Parameters:
-        group (pd.DataFrame): DataFrame with composite_index, temp_anomaly, and temp_anomaly_lagged.
-        lag_years (int): Number of years for lagged correlation.
+    Parameters
+    ----------
+    group : pd.DataFrame
+        DataFrame containing 'composite_index', 'temp_anomaly', and 'temp_anomaly_lagged'.
+    lag_years : int
+        Number of years for lagged correlation.
+    min_size : int, optional
+        Minimum sample size for reliable correlation (default=MIN_SAMPLE_CORR).
 
-    Returns:
-        dict: Correlation coefficients and p-values.
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'spearman_corr': Spearman's correlation coefficient
+        - 'spearman_p': p-value for Spearman's correlation
+        - 'spearman_p_perm': p-value from permutation test
+        - 'spearman_ci_lower': Lower bound of confidence interval
+        - 'spearman_ci_upper': Upper bound of confidence interval
+        - 'pearson_corr': Pearson's correlation coefficient
+        - 'pearson_p': p-value for Pearson's correlation
+        - 'kendall_corr': Kendall's tau correlation coefficient
+        - 'kendall_p': p-value for Kendall's tau
+        - 'lagged_spearman_corr': Spearman's correlation with lagged temperature
+        - 'lagged_spearman_p': p-value for lagged Spearman's correlation
+        - 'years_count': Number of years with valid data
+        - 'lagged_years_count': Number of years with valid lagged data
+        - 'impact_spearman_corr': Spearman's correlation for normalized impact
+        - 'impact_spearman_p': p-value for impact correlation
+        - 'frequency_spearman_corr': Spearman's correlation for normalized frequency
+        - 'frequency_spearman_p': p-value for frequency correlation
+
+    Notes
+    -----
+    - Requires at least 2 valid data points.
+    - If sample size < min_size, a warning is logged.
+    - Uses permutation test for Spearman's p-value.
+
     """
     valid_data = group.dropna(subset=["composite_index", "temp_anomaly"])
     valid_lagged = group.dropna(subset=["composite_index", "temp_anomaly_lagged"])
@@ -313,7 +429,7 @@ def compute_correlations(
     perm_result = permutation_test(
         (valid_data["composite_index"], valid_data["temp_anomaly"]),
         statistic=spearman_statistic,
-        permutation_type="pairings",  
+        permutation_type="pairings",
         n_resamples=999,  # Reasonable default for approximation; adjust as needed
         alternative="two-sided",
     )
@@ -321,26 +437,14 @@ def compute_correlations(
     spearman_p_perm = perm_result.pvalue
 
     # Bootstrap CI
-    spearman_lower, spearman_upper = bootstrap_ci(
-        valid_data["composite_index"], valid_data["temp_anomaly"]
-    )
+    spearman_lower, spearman_upper = bootstrap_ci(valid_data["composite_index"], valid_data["temp_anomaly"])
 
-    spearman_corr, spearman_p = spearmanr(
-        valid_data["composite_index"], valid_data["temp_anomaly"]
-    )
-    pearson_corr, pearson_p = pearsonr(
-        valid_data["composite_index"], valid_data["temp_anomaly"]
-    )
-    kendall_corr, kendall_p = kendalltau(
-        valid_data["composite_index"], valid_data["temp_anomaly"]
-    )
-    lagged_corr, lagged_p = spearmanr(
-        valid_lagged["composite_index"], valid_lagged["temp_anomaly_lagged"]
-    )
+    spearman_corr, spearman_p = spearmanr(valid_data["composite_index"], valid_data["temp_anomaly"])
+    pearson_corr, pearson_p = pearsonr(valid_data["composite_index"], valid_data["temp_anomaly"])
+    kendall_corr, kendall_p = kendalltau(valid_data["composite_index"], valid_data["temp_anomaly"])
+    lagged_corr, lagged_p = spearmanr(valid_lagged["composite_index"], valid_lagged["temp_anomaly_lagged"])
 
-    impact_spearman_corr, impact_spearman_p = spearmanr(
-        valid_data["norm_total_impact"], valid_data["temp_anomaly"]
-    )
+    impact_spearman_corr, impact_spearman_p = spearmanr(valid_data["norm_total_impact"], valid_data["temp_anomaly"])
     frequency_spearman_corr, frequency_spearman_p = spearmanr(
         valid_data["norm_event_frequency"], valid_data["temp_anomaly"]
     )
@@ -368,9 +472,7 @@ def compute_correlations(
 
 def compute_granger_causality(
     group: pd.DataFrame, max_lag: int
-) -> tuple[
-    dict[str, dict[str, list[float]]], dict[str, dict[str, list[float]]], int, int
-]:
+) -> tuple[dict[str, dict[str, list[float]]], dict[str, dict[str, list[float]]], int, int]:
     """
     Compute Granger Causality p-values in both directions for optimal lags selected by AICc and BIC.
 
@@ -382,15 +484,31 @@ def compute_granger_causality(
         5. Run Granger causality tests for optimal lags > 0.
         6. Return p-values for forward (temp -> composite) and reverse causality.
 
-    Note: Granger causality assumes stationarity and linearity. Non-stationary series after
-    max differencing or non-linear relationships may invalidate results.
+    Parameters
+    ----------
+    group : pd.DataFrame
+        DataFrame containing 'year', 'temp_anomaly', and 'composite_index'.
+    max_lag : int
+        Maximum lag to test in VAR and Granger causality.
 
-    Parameters:
-        group (pd.DataFrame): DataFrame with 'year', 'temp_anomaly', and 'composite_index'.
-        max_lag (int): Maximum lag to test in VAR and Granger causality.
+    Returns
+    -------
+    tuple
+        - forward_p_values_by_criterion : dict
+            P-values for forward Granger causality (temp -> composite) by criterion.
+        - reverse_p_values_by_criterion : dict
+            P-values for reverse Granger causality (composite -> temp) by criterion.
+        - temp_diff : int
+            Differencing order applied to temperature series.
+        - comp_diff : int
+            Differencing order applied to composite index series.
 
-    Returns:
-        tuple: (forward p-values by criterion, reverse p-values by criterion, temp diff order, composite diff order)
+    Notes
+    -----
+    - Requires consecutive years without gaps.
+    - Handles non-stationarity by differencing up to 2 times.
+    - Uses AICc and BIC for lag selection.
+
     """
     event_type = group["event_type"].iloc[0]
     years = group["year"].sort_values().unique()
@@ -419,15 +537,9 @@ def compute_granger_causality(
         )
 
     # Set up time-indexed series for stationarity checks
-    group_indexed = group.set_index(pd.to_datetime(group["year"], format="%Y")).asfreq(
-        "YS"
-    )
-    temp_series, temp_diff = check_stationarity(
-        group_indexed["temp_anomaly"], max_diff=2, min_len=max_lag + 1
-    )
-    comp_series, comp_diff = check_stationarity(
-        group_indexed["composite_index"], max_diff=2, min_len=max_lag + 1
-    )
+    group_indexed = group.set_index(pd.to_datetime(group["year"], format="%Y")).asfreq("YS")
+    temp_series, temp_diff = check_stationarity(group_indexed["temp_anomaly"], max_diff=2, min_len=max_lag + 1)
+    comp_series, comp_diff = check_stationarity(group_indexed["composite_index"], max_diff=2, min_len=max_lag + 1)
 
     # Prepare data for VAR and Granger tests
     granger_data = pd.DataFrame(
@@ -452,34 +564,24 @@ def compute_granger_causality(
         # Fit VAR model to select optimal lags
         model = VAR(granger_data)
         lags = np.arange(0, max_lag + 1)
-        aic_vals = [float("inf")] + [
-            model.fit(int(lag)).aic for lag in range(1, max_lag + 1)
-        ]
-        bic_vals = [float("inf")] + [
-            model.fit(int(lag)).bic for lag in range(1, max_lag + 1)
-        ]
+        aic_vals = [float("inf")] + [model.fit(int(lag)).aic for lag in range(1, max_lag + 1)]
+        bic_vals = [float("inf")] + [model.fit(int(lag)).bic for lag in range(1, max_lag + 1)]
         aicc_vals = compute_aicc(np.array(aic_vals), n, lags, m=2)
 
         # Select optimal lags, excluding lag 0
         optimal_lags = {
-            "aicc": int(np.argmin(aicc_vals[1:]) + 1)
-            if np.isfinite(aicc_vals[1:]).any()
-            else 0,
-            "bic": int(np.argmin(bic_vals[1:]) + 1)
-            if np.isfinite(bic_vals[1:]).any()
-            else 0,
+            "aicc": int(np.argmin(aicc_vals[1:]) + 1) if np.isfinite(aicc_vals[1:]).any() else 0,
+            "bic": int(np.argmin(bic_vals[1:]) + 1) if np.isfinite(bic_vals[1:]).any() else 0,
         }
         logging.info(f"{group['event_type'].iloc[0]}: Optimal lags = {optimal_lags}")
 
         # Initialize p-value dictionaries with nested structure for each test type
         test_types = ["params_ftest", "ssr_ftest"]
         forward_p_values_by_criterion = {
-            crit: {test: [float("nan")] * max_lag for test in test_types}
-            for crit in optimal_lags
+            crit: {test: [float("nan")] * max_lag for test in test_types} for crit in optimal_lags
         }
         reverse_p_values_by_criterion = {
-            crit: {test: [float("nan")] * max_lag for test in test_types}
-            for crit in optimal_lags
+            crit: {test: [float("nan")] * max_lag for test in test_types} for crit in optimal_lags
         }
 
         # Run Granger causality tests only for optimal lags > 0
@@ -501,36 +603,26 @@ def compute_granger_causality(
                 if opt_lag == lag:
                     forward_p_values_by_criterion[crit] = {
                         "params_ftest": [
-                            result[lag_order][0]["params_ftest"][1]
-                            if lag_order in result
-                            else float("nan")
+                            result[lag_order][0]["params_ftest"][1] if lag_order in result else float("nan")
                             for lag_order in range(1, max_lag + 1)
                         ],
                         "ssr_ftest": [
-                            result[lag_order][0]["ssr_ftest"][1]
-                            if lag_order in result
-                            else float("nan")
+                            result[lag_order][0]["ssr_ftest"][1] if lag_order in result else float("nan")
                             for lag_order in range(1, max_lag + 1)
                         ],
                     }
                     reverse_p_values_by_criterion[crit] = {
                         "params_ftest": [
-                            result[lag_order][0]["params_ftest"][1]
-                            if lag_order in result_rev
-                            else float("nan")
+                            result[lag_order][0]["params_ftest"][1] if lag_order in result_rev else float("nan")
                             for lag_order in range(1, max_lag + 1)
                         ],
                         "ssr_ftest": [
-                            result[lag_order][0]["ssr_ftest"][1]
-                            if lag_order in result_rev
-                            else float("nan")
+                            result[lag_order][0]["ssr_ftest"][1] if lag_order in result_rev else float("nan")
                             for lag_order in range(1, max_lag + 1)
                         ],
                     }
     except ValueError as e:
-        logging.debug(
-            f"Granger test failed due to VAR fitting error (e.g., singular matrix): {str(e)}"
-        )
+        logging.debug(f"Granger test failed due to VAR fitting error (e.g., singular matrix): {e!s}")
         test_types = ["params_ftest", "ssr_ftest"]
         return (
             {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
@@ -540,7 +632,7 @@ def compute_granger_causality(
         )
 
     except Exception as e:
-        logging.debug(f"Granger test failed due to unexpected error: {str(e)}")
+        logging.debug(f"Granger test failed due to unexpected error: {e!s}")
         test_types = ["params_ftest", "ssr_ftest"]
         return (
             {"aicc": {test: [float("nan")] * max_lag for test in test_types}},
@@ -565,10 +657,32 @@ def analyze_event_type_correlations(
     max_granger_lag: int = 2,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute multiple correlation metrics and Granger Causality (forward and reverse) between each event type's
-    composite index and temperature anomalies, with dynamic stationarity adjustment.
+    Compute multiple correlation metrics and Granger Causality between each event type's
+    composite index and temperature anomalies.
+
+    Parameters
+    ----------
+    noaa_df : pd.DataFrame
+        NOAA data with composite index.
+    giss_df : pd.DataFrame
+        NASA GISS temperature anomalies.
+    min_years : int, optional
+        Minimum number of years for analysis (default=10).
+    lag_years : int, optional
+        Lag years for correlation (default=1).
+    max_granger_lag : int, optional
+        Maximum lag for Granger Causality (default=2).
+
+    Returns
+    -------
+    tuple
+        - corr_df : pd.DataFrame
+            Correlation and Granger Causality results.
+        - merged_df : pd.DataFrame
+            Merged NOAA and GISS data.
+
     """
-    merged_df = pd.merge(noaa_df, giss_df, on="year", how="inner")
+    merged_df = noaa_df.merge(giss_df, on="year", how="inner")
     if merged_df.empty:
         logging.warning("No overlapping data between NOAA and GISS datasets")
         return pd.DataFrame(), pd.DataFrame()
@@ -576,9 +690,7 @@ def analyze_event_type_correlations(
     unlagged_merged_df = merged_df.copy(deep=True)
 
     merged_df = merged_df.assign(
-        temp_anomaly_lagged=lambda x: x.groupby("event_type")["temp_anomaly"].shift(
-            lag_years
-        ),
+        temp_anomaly_lagged=lambda x: x.groupby("event_type")["temp_anomaly"].shift(lag_years),
     )
 
     correlations = []
@@ -591,9 +703,7 @@ def analyze_event_type_correlations(
         if not corr_results:
             continue
 
-        granger_results, rev_granger_results, temp_diff, comp_diff = (
-            compute_granger_causality(group, max_granger_lag)
-        )
+        granger_results, rev_granger_results, temp_diff, comp_diff = compute_granger_causality(group, max_granger_lag)
         granger_data = group.dropna(subset=["temp_anomaly", "composite_index"])
 
         result = {
@@ -609,15 +719,14 @@ def analyze_event_type_correlations(
                     range(1, max_granger_lag + 1),
                     granger_results[crit][test_type],
                     rev_granger_results[crit][test_type],
+                    strict=False,
                 ):
                     result[f"{crit}_{test_type}_p_lag{lag}"] = forward_p_value
                     result[f"{crit}_rev_{test_type}_p_lag{lag}"] = reverse_p_value
 
         correlations.append(result)
 
-    corr_df = pd.DataFrame(correlations).sort_values(
-        by="spearman_corr", ascending=False
-    )
+    corr_df = pd.DataFrame(correlations).sort_values(by="spearman_corr", ascending=False)
 
     # Highlight significant Granger results
     significant = []
@@ -637,9 +746,7 @@ def analyze_event_type_correlations(
         for sig in significant:
             logging.info(sig)
 
-    logging.info(
-        "Top 10 event types by Spearman correlation with temperature anomalies:"
-    )
+    logging.info("Top 10 event types by Spearman correlation with temperature anomalies:")
     logging.info(
         corr_df[
             [
@@ -656,7 +763,13 @@ def analyze_event_type_correlations(
     return corr_df, unlagged_merged_df
 
 
-def main():
+def main() -> None:
+    """
+    Main function to run the analysis script.
+
+    Parses command-line arguments, processes data, computes correlations and Granger Causality,
+    and launches a dashboard for visualization.
+    """
     parser = argparse.ArgumentParser(
         description="Analyze correlations and Granger Causality between NOAA event types and NASA GISS temperature anomalies."
     )
@@ -740,9 +853,7 @@ def main():
         args.injury_weight,
         args.death_weight,
     )
-    noaa_df = compute_composite_index(
-        aggregated_df, args.impact_weight, args.frequency_weight
-    )
+    noaa_df = compute_composite_index(aggregated_df, args.impact_weight, args.frequency_weight)
 
     corr_df, merged_df = analyze_event_type_correlations(
         noaa_df,
@@ -753,9 +864,9 @@ def main():
     )
 
     if not corr_df.empty:
-        logging.info("Full results saved to 'event_type_analysis.csv'")
+        logging.info("Full results saved to 'output/event_type_analysis.csv'")
         pd.set_option("display.float_format", "{:.3f}".format)
-        corr_df.to_csv("event_type_analysis.csv", index=False)
+        corr_df.to_csv("output/event_type_analysis.csv", index=False)
         logging.info("Summary of correlations and Granger Causality (lag 1 only):")
         logging.info(
             corr_df[
@@ -775,7 +886,7 @@ def main():
         )
         launch_dashboard(merged_df, corr_df)
     else:
-        print("No significant correlations or causality found.")
+        logging.warning("No significant correlations or causality found.")
 
 
 if __name__ == "__main__":
