@@ -864,9 +864,9 @@ def main() -> None:
     )
 
     if not corr_df.empty:
-        logging.info("Full results saved to 'output/event_type_analysis.csv'")
+        logging.info("Full results saved to 'data/output/event_type_analysis.csv'")
         pd.set_option("display.float_format", "{:.3f}".format)
-        corr_df.to_csv("output/event_type_analysis.csv", index=False)
+        corr_df.to_csv("data/output/event_type_analysis.csv", index=False)
         logging.info("Summary of correlations and Granger Causality (lag 1 only):")
         logging.info(
             corr_df[
